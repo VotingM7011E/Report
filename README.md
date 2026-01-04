@@ -1,245 +1,329 @@
-# VotingM7011E - Final Project Summary (Seminar Hand-in)
+# VotingM7011E — Seminar Pre‑Submission Report (Draft)
 
-This document is a single-file summary aligned with the seminar submission checklist:
-- Motivation: why the system is a dynamic web system
-- High-level architecture diagrams: services + communication, GitOps CI/CD, security request flow, monitoring
-- Database schemas (graphical)
+**Last updated:** 2026-01-04 22:52  
+**Status:** Initial submission for seminar (can be expanded after the seminar).
 
----
-
-## 1) Links (repository / organisation)
-
-- GitHub organization: https://github.com/VotingM7011E
-- Repository list (all repos): https://github.com/orgs/VotingM7011E/repositories
-- GitOps repo: https://github.com/VotingM7011E/gitops
+## GitHub links
+- **Organization:** https://github.com/VotingM7011E
+- **Repositories (microservices):** https://github.com/orgs/VotingM7011E/repositories
+- **GitOps repo (Argo CD + Helm):** https://github.com/VotingM7011E/gitops
 
 ---
 
-## 2) Motivation: why this is a dynamic web system
+## 1) Motivation — Why this is a *dynamic web system*
 
-A dynamic web system changes content and behavior at runtime based on user input, stored data, and system state (not static pages served unchanged).[^dyn1][^dyn2]
+A dynamic web system changes what it returns (data, UI state, permissions) based on **user input, stored data, and runtime state**, rather than serving static pages.
 
-In VotingM7011E, the system is dynamic because:
-
-- User actions drive state transitions (meetings progress, nominations are added/accepted, positions are opened/closed, votes happen), which changes what users can do and what the UI/APIs return.
-- Services persist and query domain state (for example ElectionService positions and nominations), so responses depend on current database state.
-- Access is identity and permission dependent, so different users can see/do different things.
+In our system:
+- Users authenticate via **Keycloak (OIDC)** and receive tokens; backend APIs authorize requests based on meeting‑scoped roles (view/vote/manage).
+- The system state changes over time (meeting agenda item index, nomination windows, voting in progress/completed), which changes what users can do and what is shown.
+- Data is persisted in databases (MongoDB collections for meeting/motion state; SQL databases for elections and voting) and drives responses.
+- The system is decomposed into multiple **microservices** communicating with both synchronous HTTP and asynchronous events (RabbitMQ), enabling evolving behavior.
 
 ---
 
-## 3) High-level architecture
+## 2) High‑level architecture
 
-### 3.1 Services (current repos)
+### 2.1 Microservices and responsibilities (current code)
 
-From the organization repository list, the system is split into separate services and infrastructure repos:
+- **MeetingService** (Flask + MongoDB + Socket.IO)
+  - Create meetings, manage agenda items, update `current_item`.
+  - Publishes events:
+    - `permission.create_meeting` when a meeting is created (so creator becomes manager/viewer)
+    - `motion.create_motion_item` when moving to a motion agenda item
+    - `motion.start_voting` when starting vote for a motion agenda item
 
-- MeetingService
-- ElectionService
-- MotionService
-- VotingService
-- PermissionService
-- Frontend
-- gitops
+- **PermissionService** (Flask + Keycloak Admin)
+  - Meeting‑scoped roles stored as Keycloak realm roles: `z-<meeting_id>-<role>` where role ∈ {view, vote, manage}.
+  - REST endpoints to read/write roles.
+  - Consumes event `permission.create_meeting` to grant the meeting creator `view` + `manage`.
 
-This structure is visible in the organization repository list.[^org1]
+- **MotionService** (Flask + MongoDB + Socket.IO)
+  - Stores motion items with motions and orchestrates sequential voting.
+  - Consumes:
+    - `motion.create_motion_item`
+    - `motion.start_voting`
+    - `voting.created`
+    - `voting.completed`
+  - Publishes:
+    - `voting.create` (request VotingService to create a poll)
 
-This follows a microservices approach: independently deployable services that communicate via APIs and messaging.[^ms1][^ms2]
+- **VotingService** (Flask + SQLAlchemy)
+  - Stores polls, options, votes, vote selections.
+  - Consumes:
+    - `voting.create`
+  - Publishes:
+    - `voting.created` (poll created)
+    - `voting.completed` (poll completed when expected voters reached)
+  - Calls PermissionService to compute eligible voters (role `vote`) when needed.
 
-### 3.2 Communication (HTTP + RabbitMQ)
+- **ElectionService** (Flask + PostgreSQL)
+  - Tables: `positions`, `nominations`.
+  - Current implementation creates a poll by HTTP call to VotingService (planned: migrate to MQ like MotionService).
 
-- HTTP/REST for synchronous calls (Frontend -> services)
-- RabbitMQ for asynchronous workflow events between services
+> Note: Some services are still in progress (ElectionService uses HTTP for poll creation today; the target design is fully event-driven).
 
-RabbitMQ supports Prometheus metrics via the built-in `rabbitmq_prometheus` plugin and exposes metrics at `/metrics` (commonly port 15692).[^rmq1][^rmq2]
+### 2.2 Communication model
 
-#### Diagram: services and communication
+- **HTTP/REST:** user/client requests to services; ElectionService → VotingService poll creation currently via HTTP.
+- **RabbitMQ events:** asynchronous orchestration of workflows (meeting creation → permissions; motion voting lifecycle; voting creation/completion callbacks).
+
+### 2.3 Architecture diagram (Mermaid)
 
 ```mermaid
 flowchart LR
   subgraph Client
-    U[User Browser]
-    FE[Frontend]
+    U["User Browser"]
+    FE["Frontend"]
   end
 
   subgraph Identity
-    KC[Keycloak OIDC]
-  end
-
-  subgraph Services
-    MS[MeetingService]
-    ES[ElectionService]
-    MOS[MotionService]
-    VS[VotingService]
-    PS[PermissionService]
+    KC["Keycloak"]
   end
 
   subgraph Messaging
-    RMQ[RabbitMQ]
+    RMQ[("RabbitMQ")]
+  end
+
+  subgraph Services
+    MS["MeetingService<br/>MongoDB + Socket.IO"]
+    PS["PermissionService<br/>Keycloak Admin"]
+    MOS["MotionService<br/>MongoDB + Socket.IO"]
+    VS["VotingService<br/>SQL DB (SQLAlchemy)"]
+    ES["ElectionService<br/>Postgres"]
   end
 
   U --> FE
-  FE --> MS
-  FE --> ES
-  FE --> MOS
-  FE --> VS
+  FE -->|"HTTPS + Bearer JWT"| MS
+  FE -->|"HTTPS + Bearer JWT"| MOS
+  FE -->|"HTTPS + Bearer JWT"| VS
   FE <--> KC
 
-  MS --> RMQ
-  RMQ --> ES
-  RMQ --> MOS
-  RMQ --> VS
+  %% Meeting -> Permission
+  MS -->|"permission.create_meeting"| RMQ
   RMQ --> PS
-```
 
-GitHub renders Mermaid diagrams when Mermaid syntax is inside a fenced code block with the `mermaid` language identifier.[^gh-mermaid]
+  %% Meeting -> Motion
+  MS -->|"motion.create_motion_item"| RMQ
+  MS -->|"motion.start_voting"| RMQ
+  RMQ --> MOS
+
+  %% Motion -> Voting
+  MOS -->|"voting.create"| RMQ
+  RMQ --> VS
+
+  %% Voting callbacks -> Motion
+  VS -->|"voting.created"| RMQ
+  VS -->|"voting.completed"| RMQ
+  RMQ --> MOS
+
+  %% Election currently via HTTP
+  ES -->|"HTTP POST /polls/"| VS
+
+  %% Permission roles stored in Keycloak
+  PS --> KC
+  VS -->|"HTTP GET eligible voters"| PS
+```
 
 ---
 
-## 4) GitOps CI/CD (how deployments happen)
+## 3) GitOps CI/CD (high level)
 
-We use Argo CD for GitOps continuous delivery: desired Kubernetes state is stored in Git and Argo CD reconciles the cluster to match.[^argo1][^argo2]
+We deploy using **GitOps**:
+- **Argo CD** watches Git repositories for desired Kubernetes manifests and continuously reconciles the cluster to match Git.
+- Services are deployed as Helm charts with environment-specific values.
 
-A documented pattern in this organization is:
-
-1) GitHub Actions builds a container image
-2) Push image to GitHub Container Registry (GHCR)
-3) Update values/manifests in the GitOps repo
-4) Argo CD detects Git changes and syncs to Kubernetes
-
-(See the CI/CD demo repos in the organization for the applied pattern.)[^org1]
-
-#### Diagram: GitOps pipeline
+### 3.1 GitOps pipeline diagram
 
 ```mermaid
 flowchart LR
-  DEV[Developer]
-  CODE[Service repo]
-  CI[GitHub Actions]
-  REG[GHCR]
-  GITOPS[GitOps repo]
-  ARGO[Argo CD]
-  K8S[Kubernetes cluster]
-
-  DEV --> CODE
-  CODE --> CI
-  CI --> REG
-  CI --> GITOPS
-  ARGO --> GITOPS
-  ARGO --> K8S
+  DEV[Developers] -->|push code| REPO[Service Repositories]
+  REPO -->|CI builds/tests| CI[GitHub Actions]
+  CI -->|push images| REG[Container Registry]
+  CI -->|update image tags/values| GITOPS[gitops repo]
+  ARGO[Argo CD] -->|pull desired state| GITOPS
+  ARGO -->|sync/apply| K8S[Kubernetes Cluster]
+  K8S --> RUN[Running Services]
 ```
 
 ---
 
-## 5) Security model (Keycloak + JWT request flow)
+## 4) Security model (request flow)
 
-We use Keycloak as an OpenID Connect (OIDC) provider.[^kc1] Applications/services validate bearer access tokens (JWTs) on each request (typical REST security model).[^kc2]
+### 4.1 Identity and tokens
+- **Keycloak** acts as the OpenID Connect provider.
+- Frontend uses an **Authorization Code** style login flow (redirect to Keycloak, exchange code for token).
+- Backend APIs receive `Authorization: Bearer <access_token>` and enforce access based on meeting roles.
 
-High-level request flow:
+### 4.2 Meeting-scoped authorization
+- PermissionService manages roles in Keycloak per meeting:
+  - `z-<meeting_id>-view`
+  - `z-<meeting_id>-vote`
+  - `z-<meeting_id>-manage`
+- Services use `check_role(user, meeting_id, action)` to gate routes.
+
+### 4.3 Security flow diagram
 
 ```mermaid
 sequenceDiagram
   participant User
-  participant Frontend
-  participant Keycloak
+  participant FE as Frontend
+  participant KC as Keycloak
   participant API as Backend APIs
 
-  User->>Frontend: Open app
-  Frontend->>Keycloak: Redirect to login
-  User->>Keycloak: Authenticate
-  Keycloak->>Frontend: Authorization code
-  Frontend->>Keycloak: Exchange code for tokens
-  Keycloak-->>Frontend: Access token (Bearer)
-  Frontend->>API: Authorization: Bearer <JWT>
-  API-->>Frontend: Authorized response
+  User->>FE: Open app
+  FE->>KC: Redirect to login (OIDC authorize)
+  KC->>User: Login form
+  User->>KC: Credentials
+  KC->>FE: Authorization code
+  FE->>KC: Exchange code for tokens
+  KC-->>FE: access_token (Bearer JWT)
+  FE->>API: Requests with Authorization: Bearer <JWT>
+  API-->>FE: Response (depends on role & meeting state)
 ```
 
-Kubernetes secrets note: Secret values are base64-encoded and stored unencrypted by default unless encryption at rest is configured.[^k8s-secrets]
-
-Argo CD secret handling note: Argo CD documents secret-management approaches to avoid committing plaintext secrets to Git (e.g., sealed/encrypted secret workflows).[^argo-secrets]
+### 4.4 Secret handling (GitOps)
+- Kubernetes Secrets are **base64-encoded** and should be treated as sensitive.
 
 ---
 
-## 6) Monitoring (metrics)
+## 5) Monitoring (metrics/logs/traces)
 
-We use Prometheus + Grafana for metrics. With Prometheus Operator, targets can be discovered via ServiceMonitor / PodMonitor resources.[^promop]
+### 5.1 Metrics
+- **Prometheus + Grafana** used for metrics and dashboards.
+- RabbitMQ exposes Prometheus metrics via `rabbitmq_prometheus` plugin at `/metrics` (default port 15692).
+- Prometheus Operator discovers targets using **ServiceMonitor** resources.
 
-RabbitMQ metrics are exposed via the Prometheus plugin at /metrics (commonly port 15692).[^rmq1][^rmq2]
+### 5.2 Logs and traces
+- Logs: currently via Kubernetes pod logs; centralized aggregation planned.
+- Traces: not implemented yet (future extension).
+
+### 5.3 Monitoring diagram
 
 ```mermaid
 flowchart LR
-  SVC[Services] --> PROM[Prometheus]
-  RMQ[RabbitMQ /metrics] --> PROM
+  SVC[Services] -->|/metrics| PROM[Prometheus]
+  RMQ[(RabbitMQ /metrics)] -->|/metrics| PROM
   PROM --> GRAF[Grafana]
 ```
 
 ---
 
-## 7) Database schemas
+## 6) Database schemas (graphical; draft)
 
-### 7.1 ElectionService database schema (from provided project docs)
+> These schemas are inferred from code. Next step after seminar: export from live DBs for authoritative ERDs.
 
-The ElectionService docs included in this submission define these tables:
-
-- positions(position_id PK, meeting_id UUID, position_name, is_open)
-- nominations(position_id FK, username, accepted) with a composite primary key (position_id, username)
-
-Source files provided with this submission: `schema.sql` and `api.yml`.
+### 6.1 VotingService (SQLAlchemy)
 
 ```mermaid
 erDiagram
-  POSITIONS ||--o{ NOMINATIONS : has
+    POLL ||--o{ POLL_OPTION : has
+    POLL ||--o{ VOTE : receives
+    VOTE ||--o{ VOTE_SELECTION : contains
 
-  POSITIONS {
-    int position_id PK
-    uuid meeting_id
-    string position_name
-    boolean is_open
-  }
-
-  NOMINATIONS {
-    int position_id PK
-    string username PK
-    boolean accepted
-  }
+    POLL {
+      uuid uuid PK
+      string meeting_id
+      string poll_type
+      int expected_voters
+      bool completed
+    }
+    POLL_OPTION {
+      int id PK
+      int poll_id FK
+      string option_value
+      int option_order
+    }
+    VOTE {
+      int id PK
+      int poll_id FK
+      string user_id
+    }
+    VOTE_SELECTION {
+      int id PK
+      int vote_id FK
+      int poll_option_id FK
+      int rank_order
+    }
 ```
 
-### 7.2 ElectionService API surface (from provided OpenAPI)
+### 6.2 ElectionService (PostgreSQL)
 
-The provided OpenAPI (`api.yml`) describes endpoints:
+```mermaid
+erDiagram
+    POSITIONS ||--o{ NOMINATIONS : has
 
-- POST /positions
-- GET /positions
-- POST /positions/{id}/close
-- POST /positions/{id}/nominations
-- GET /positions/{id}/nominations
-- GET /positions/{id}/nominations/{username}
-- POST /positions/{id}/nominations/{username}/accept
+    POSITIONS {
+      int position_id PK
+      string meeting_id
+      string position_name
+      bool is_open
+      string poll_id
+    }
+    NOMINATIONS {
+      int position_id FK
+      string username PK
+      bool accepted
+    }
+```
 
-Implementation note to fix: `meeting_id` is declared as UUID in the create request but appears as integer in the `Position` schema in the OpenAPI; this should be made consistent with the database schema.
+### 6.3 MeetingService (MongoDB; document shape)
+
+```mermaid
+erDiagram
+    MEETINGS ||--o{ AGENDA_ITEMS : contains
+
+    MEETINGS {
+      string meeting_id PK
+      string meeting_name
+      int current_item
+      string meeting_code
+    }
+    AGENDA_ITEMS {
+      string meeting_id FK
+      string type
+      string title
+      string motion_item_id
+      bool motion_published
+    }
+```
+
+### 6.4 MotionService (MongoDB; document shape)
+
+```mermaid
+erDiagram
+    MOTION_ITEM ||--o{ MOTION : includes
+
+    MOTION_ITEM {
+      string motion_item_id PK
+      string meeting_id
+      string poll_uuid
+      string poll_state
+      string voting_state
+      int current_index
+    }
+    MOTION {
+      string motion_uuid PK
+      string owner
+      string motion
+    }
+```
+
+### 6.5 PermissionService (Keycloak roles)
+
+Meeting-scoped realm roles in Keycloak:
+- `z-<meeting_id>-view`
+- `z-<meeting_id>-vote`
+- `z-<meeting_id>-manage`
 
 ---
 
-## 8) Notes on references (GitHub-friendly footnotes)
+## References (external docs)
 
-GitHub supports Markdown footnotes using the `[^id]` marker and a matching definition like `[^id]: ...` at the bottom of the file.[^gh-footnotes]
-
----
-
-## References
-
-[^org1]: VotingM7011E organization repositories list: https://github.com/orgs/VotingM7011E/repositories
-[^dyn1]: Wikipedia - Dynamic web page: https://en.wikipedia.org/wiki/Dynamic_web_page
-[^dyn2]: Fiveable - Dynamic web applications (term overview): https://fiveable.me/key-terms/media-literacy/dynamic-web-applications
-[^ms1]: Atlassian - Microservices architecture: https://www.atlassian.com/microservices/microservices-architecture
-[^ms2]: Microsoft - Microservices architecture style (Azure Architecture Center): https://learn.microsoft.com/en-us/azure/architecture/guide/architecture-styles/microservices
-[^rmq1]: RabbitMQ documentation - Prometheus: https://www.rabbitmq.com/docs/prometheus
-[^rmq2]: RabbitMQ Prometheus plugin README (source): https://github.com/rabbitmq/rabbitmq-server/blob/main/deps/rabbitmq_prometheus/README.md
-[^gh-mermaid]: GitHub Docs - Creating diagrams (Mermaid fenced code blocks): https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/creating-diagrams
-[^argo1]: Argo CD documentation (overview): https://argo-cd.readthedocs.io/
-[^argo2]: Argo CD Application specification: https://argo-cd.readthedocs.io/en/stable/user-guide/application-specification/
-[^kc1]: Keycloak - Securing Apps / OIDC layers: https://www.keycloak.org/securing-apps/oidc-layers
-[^kc2]: Keycloak Authorization Services guide (bearer token-based REST security): https://www.keycloak.org/docs/latest/authorization_services/index.html
-[^k8s-secrets]: Kubernetes - Secrets good practices: https://kubernetes.io/docs/concepts/security/secrets-good-practices/
-[^argo-secrets]: Argo CD - Secret management: https://argo-cd.readthedocs.io/en/stable/operator-manual/secret-management/
-[^promop]: Prometheus Operator - Getting started: https://prometheus-operator.dev/docs/developer/getting-started/
-[^gh-footnotes]: GitHub Changelog - Footnotes now supported in Markdown fields (syntax example): https://github.blog/changelog/2021-09-30-footnotes-now-supported-in-markdown-fields/
+- Argo CD (GitOps continuous delivery): https://argo-cd.readthedocs.io/
+- Argo CD Application spec (Helm valueFiles, etc.): https://argo-cd.readthedocs.io/en/stable/user-guide/application-specification/
+- Argo CD Secret Management guidance: https://argo-cd.readthedocs.io/en/stable/operator-manual/secret-management/
+- Prometheus Operator (ServiceMonitor/PodMonitor): https://prometheus-operator.dev/docs/developer/getting-started/
+- RabbitMQ Prometheus monitoring (`/metrics`): https://www.rabbitmq.com/docs/prometheus
+- RabbitMQ URI spec: https://www.rabbitmq.com/docs/uri-spec
+- Kubernetes DNS for Services: https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/
